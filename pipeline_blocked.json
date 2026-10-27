@@ -1,0 +1,5 @@
+{
+  "node": "code_reviewer",
+  "error": "Erreur d'ex\u00e9cution du code_reviewer : CalledProcessError(128, ['git', 'diff', 'HEAD'])",
+  "since": "Tue Oct 27 22:52:25 2026"
+}

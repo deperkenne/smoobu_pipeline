@@ -20,6 +20,7 @@ Commandes
 """
 import argparse
 import email
+import hashlib
 import imaplib
 import json
 import os
@@ -73,6 +74,7 @@ ALERT_TO = os.getenv("ALERT_TO", "tchofodep@gmail.com")
 USE_SAMPLE_EMAIL = os.getenv("USE_SAMPLE_EMAIL", "").lower() == "true"
 
 BLOCK_FILE = Path("pipeline_blocked.json")  # présent = pipeline bloqué
+REVIEW_CACHE = Path(".last_review.json")  # dernier diff analysé + verdict
 MAX_RETRIES = 2  # relances automatiques max par agent
 RETRYABLE_NODES = {"pipeline_email", "load_to_db"}  # seuls agents relançables automatiquement
 
@@ -254,29 +256,49 @@ def ok(**extra) -> dict:
 # --------------------------------------------------------------------------- #
 # 5. LES 8 AGENTS                                                             #
 # --------------------------------------------------------------------------- #
+def _read_review_cache() -> dict:
+	try:
+		return json.loads(REVIEW_CACHE.read_text(encoding="utf-8"))
+	except (OSError, ValueError):
+		return {}
+
+
 def code_reviewer_node(state: AgentState) -> dict:
 	print("\n--- [1] code_reviewer : analyse du git diff ---")
 	try:
 		diff = run_git_diff()
 		if not diff:
-			state["no_new_commit"] = True
-			print("Aucun changement local : code validé par défaut.")
-			return True
+			# Pas de modification : on n'appelle pas le LLM (économie de tokens).
+			print("Aucun changement local : LLM non appelé, code validé par défaut.")
+			return ok(code_diff="", no_new_commit=True)
+
+		# Même diff que lors de la dernière revue : on réutilise le verdict sans rappeler le LLM.
+		diff_hash = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+		cached = _read_review_cache()
+		if cached.get("hash") == diff_hash:
+			print("Diff inchangé depuis la dernière revue : LLM non appelé, verdict réutilisé.")
+			if cached.get("is_clean"):
+				return ok(code_diff=diff, no_new_commit=False)
+			return {**fail("code_reviewer", f"Revue de code refusée : {cached.get('reason', '')}"),
+					"code_diff": diff}
 
 		prompt = f"""
 			Tu es un Lead Software Engineer expert en architecture logicielle et revue de code.
-			Analyse l'INTÉGRALITÉ du code source suivant :
+			Analyse le git diff suivant :
 
-			```python
+			```diff
+			{diff}
 			```
 
 			Vérifie la robustesse globale, l'architecture, le typage, la gestion des erreurs et l'absence de failles ou de bugs potentiels.
 			Détermine si le code est propre (`is_clean = True`) ou s'il présente des anomalies bloquantes (`is_clean = False`).
 			"""
 		verdict = structured_llm(ReviewVerdict).invoke(prompt)
+		REVIEW_CACHE.write_text(json.dumps({"hash": diff_hash, "is_clean": verdict.is_clean,
+											"reason": verdict.reason}), encoding="utf-8")
 		if verdict.is_clean:
 			print(f"Code validé : {verdict.reason}")
-			return ok(code_diff=diff)
+			return ok(code_diff=diff, no_new_commit=False)
 		return {**fail("code_reviewer", f"Revue de code refusée : {verdict.reason}"), "code_diff": diff}
 
 	except Exception as e:
@@ -490,8 +512,6 @@ def make_router(node_name: str):
 		if key and not state.get(key):
 			print(f"Rien à traiter après '{node_name}' : fin du cycle.")
 			return "stop"  # rien de nouveau : inutile de continuer
-		if state.get("no_new_commit"):
-			return "next"
 		return "next"  # tout va bien : agent suivant
 
 	router.__name__ = f"route_after_{node_name}"

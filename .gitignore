@@ -3,3 +3,4 @@ __pycache__/
 .idea/
 .env
 pipeline_blocked.json
+.last_review.json

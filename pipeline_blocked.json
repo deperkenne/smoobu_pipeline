@@ -1,5 +1,5 @@
 {
-  "node": "code_reviewer",
-  "error": "Erreur d'ex\u00e9cution du code_reviewer : CalledProcessError(128, ['git', 'diff', 'HEAD'])",
-  "since": "Tue Oct 27 22:52:25 2026"
+  "node": "data_transformer",
+  "error": "Extraction impossible pour : e-mail n\u00b01 : champ 'Anreise' introuvable. Le mod\u00e8le d'e-mail Smoobu a peut-\u00eatre chang\u00e9 : adaptez PATTERNS.",
+  "since": "Wed Oct 28 08:47:30 2026"
 }

@@ -21,6 +21,7 @@ Commandes
 import argparse
 import email
 import hashlib
+import html
 import imaplib
 import json
 import os
@@ -72,6 +73,7 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 SPRING_BOOT_URL = os.getenv("SPRING_BOOT_URL", "http://localhost:8080")
 ALERT_TO = os.getenv("ALERT_TO", "tchofodep@gmail.com")
 USE_SAMPLE_EMAIL = os.getenv("USE_SAMPLE_EMAIL", "").lower() == "true"
+SMOOBU_SENDER = os.getenv("SMOOBU_SENDER", "service@smoobu.com")  # seul expéditeur accepté
 
 BLOCK_FILE = Path("pipeline_blocked.json")  # présent = pipeline bloqué
 REVIEW_CACHE = Path(".last_review.json")  # dernier diff analysé + verdict
@@ -177,14 +179,30 @@ def run_pytest() -> Tuple[int, str]:
 	return r.returncode, r.stdout + "\n" + r.stderr
 
 
+def _html_to_text(raw_html: str) -> str:
+	"""Convertit le HTML en texte, une information par ligne (les e-mails Smoobu n'ont qu'une version HTML)."""
+	t = re.sub(r"(?is)<(style|script|head).*?</\1>", " ", raw_html)
+	t = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li|td|h\d)>", "\n", t)
+	t = html.unescape(re.sub(r"<[^>]+>", " ", t))
+	lines = (re.sub(r"[ \t\xa0]+", " ", line).strip() for line in t.splitlines())
+	return "\n".join(line for line in lines if line)
+
+
 def _plain_text(msg) -> str:
-	parts = msg.walk() if msg.is_multipart() else [msg]
-	for p in parts:
-		if p.get_content_type() == "text/plain" and p.get_content_disposition() != "attachment":
-			payload = p.get_payload(decode=True)
-			if payload:
-				return payload.decode(p.get_content_charset() or "utf-8", errors="ignore")
-	return ""
+	"""Renvoie la version texte de l'e-mail, ou à défaut sa version HTML convertie en texte."""
+	html_body = ""
+	for p in msg.walk():
+		if p.get_content_disposition() == "attachment":
+			continue
+		payload = p.get_payload(decode=True)
+		if not payload:
+			continue
+		text = payload.decode(p.get_content_charset() or "utf-8", errors="ignore")
+		if p.get_content_type() == "text/plain" and text.strip():
+			return text
+		if p.get_content_type() == "text/html" and not html_body:
+			html_body = text
+	return _html_to_text(html_body) if html_body else ""
 
 
 def _imap_connect():
@@ -199,7 +217,8 @@ def imap_fetch_unseen() -> Tuple[List[str], List[str]]:
 	mail = _imap_connect()
 	uids, bodies = [], []
 	try:
-		status, data = mail.uid("search", None, '(UNSEEN SUBJECT "Neue Buchung")')
+		# Seuls les e-mails envoyés par Smoobu : un e-mail de test ne bloque plus le pipeline.
+		status, data = mail.uid("search", None, f'(UNSEEN FROM "{SMOOBU_SENDER}" SUBJECT "Neue Buchung")')
 		if status == "OK" and data[0]:
 			for uid in data[0].split():
 				_, msg_data = mail.uid("fetch", uid, "(BODY.PEEK[])")

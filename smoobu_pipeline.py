@@ -30,6 +30,7 @@ import smtplib
 import subprocess
 import sys
 import time
+from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
@@ -74,6 +75,7 @@ SPRING_BOOT_URL = os.getenv("SPRING_BOOT_URL", "http://localhost:8080")
 ALERT_TO = os.getenv("ALERT_TO", "tchofodep@gmail.com")
 USE_SAMPLE_EMAIL = os.getenv("USE_SAMPLE_EMAIL", "").lower() == "true"
 SMOOBU_SENDER = os.getenv("SMOOBU_SENDER", "service@smoobu.com")  # seul expéditeur accepté
+PROCESSED_LABEL = os.getenv("SMOOBU_PROCESSED_LABEL", "smoobu-traite")  # libellé Gmail = déjà envoyé au backend
 
 BLOCK_FILE = Path("pipeline_blocked.json")  # présent = pipeline bloqué
 REVIEW_CACHE = Path(".last_review.json")  # dernier diff analysé + verdict
@@ -113,6 +115,18 @@ class SmoobuBooking(BaseModel):
 	deposit_amount: float
 	currency: str = "EUR"
 	notes: Optional[str] = None
+	guest_message: Optional[str] = None
+
+	def to_backend(self) -> Dict[str, Any]:
+		"""JSON attendu par l'entité Reservation du backend Spring Boot (l'id est généré par la base)."""
+		return {
+			"propertyName": self.property_name,
+			"checkIn": self.check_in,  # ISO « 2026-10-18 » -> LocalDate
+			"checkOut": self.check_out,
+			"guestName": self.guest_name,
+			"bookingNumber": self.booking_number,
+			"guestMessage": self.guest_message,
+		}
 
 
 class DebugAnalysis(BaseModel):
@@ -212,13 +226,19 @@ def _imap_connect():
 	return m
 
 
-def imap_fetch_unseen() -> Tuple[List[str], List[str]]:
-	"""Lit les mails non lus SANS les marquer comme lus (BODY.PEEK). Retourne (uids, textes)."""
+def imap_fetch_new() -> Tuple[List[str], List[str]]:
+	"""Lit les réservations Smoobu pas encore traitées, qu'elles soient lues ou non.
+
+	« Nouvelle » = sans le libellé Gmail PROCESSED_LABEL (posé seulement après l'envoi au backend).
+	Ouvrir l'e-mail dans Gmail ne change donc rien. Lecture avec BODY.PEEK : l'état lu/non lu n'est pas modifié.
+	Retourne (uids, textes).
+	"""
 	mail = _imap_connect()
 	uids, bodies = [], []
 	try:
-		# Seuls les e-mails envoyés par Smoobu : un e-mail de test ne bloque plus le pipeline.
-		status, data = mail.uid("search", None, f'(UNSEEN FROM "{SMOOBU_SENDER}" SUBJECT "Neue Buchung")')
+		# Recherche Gmail : seuls les e-mails envoyés par Smoobu, sans le libellé « traité ».
+		query = f'from:{SMOOBU_SENDER} subject:(Neue Buchung) -label:{PROCESSED_LABEL}'
+		status, data = mail.uid("search", None, "X-GM-RAW", f'"{query}"')
 		if status == "OK" and data[0]:
 			for uid in data[0].split():
 				_, msg_data = mail.uid("fetch", uid, "(BODY.PEEK[])")
@@ -236,13 +256,15 @@ def imap_fetch_unseen() -> Tuple[List[str], List[str]]:
 	return uids, bodies
 
 
-def imap_mark_seen(uids: List[str]) -> None:
+def imap_mark_processed(uids: List[str]) -> None:
+	"""Pose le libellé PROCESSED_LABEL sur les e-mails envoyés au backend (lu/non lu inchangé)."""
 	if not uids:
 		return
 	mail = _imap_connect()
 	try:
+		mail.create(PROCESSED_LABEL)  # sans effet si le libellé existe déjà
 		for uid in uids:
-			mail.uid("store", uid, "+FLAGS", "\\Seen")
+			mail.uid("store", uid, "+X-GM-LABELS", f'("{PROCESSED_LABEL}")')
 	finally:
 		try:
 			mail.logout()
@@ -340,7 +362,7 @@ def run_test_node(state: AgentState) -> dict:
 def pipeline_email_node(state: AgentState) -> dict:
 	print("--- [3] pipeline_email : lecture IMAP ---")
 	try:
-		uids, bodies = imap_fetch_unseen()
+		uids, bodies = imap_fetch_new()
 		if not bodies and USE_SAMPLE_EMAIL:
 			print("Boîte vide : e-mail d'exemple injecté (USE_SAMPLE_EMAIL=true).")
 			bodies = [SAMPLE_EMAIL]
@@ -359,8 +381,13 @@ PATTERNS = {
 	"Anreise": r"Anreise:\s*\w+\.,\s*(\d{2}\.\d{2}\.\d{2})",
 	"Abreise": r"Abreise:\s*\w+\.,\s*(\d{2}\.\d{2}\.\d{2})",
 	"Gast": r"Gast:\s*(.*)",
-	"Buchungsnummer": r"Buchungsnummer:\s*(\d+)",
+	"Buchungsnummer": r"Buchungsnummer:\s*([A-Za-z0-9-]+)",  # chiffres (Booking) ou lettres (Airbnb)
 }
+
+
+def _iso_date(smoobu_date: str) -> str:
+	"""« 18.10.26 » -> « 2026-10-18 » (format LocalDate du backend)."""
+	return datetime.strptime(smoobu_date, "%d.%m.%y").date().isoformat()
 
 
 def data_transformer_node(state: AgentState) -> dict:
@@ -379,15 +406,19 @@ def data_transformer_node(state: AgentState) -> dict:
 			fee = re.search(r"Payment charge is EUR\s*([\d\.]+)", raw)
 			deposit = re.search(r"Anzahlung:\s*([\d\.]+)EUR", raw)
 			notes = re.search(r"Weitere Angaben:\s*(.*)", raw)
+			# Gastnachricht : on garde les lignes de texte libre, pas celle du numéro de réservation.
+			messages = [m.strip() for m in re.findall(r"Gastnachricht:\s*(.*)", raw)
+						if not m.strip().startswith("Buchungsnummer")]
 
 			results.append(SmoobuBooking(
 				property_name=prop.group(1).strip() if prop else "Loft am Pegnitztal Nürnberg",
-				check_in=found["Anreise"], check_out=found["Abreise"],
+				check_in=_iso_date(found["Anreise"]), check_out=_iso_date(found["Abreise"]),
 				guest_name=found["Gast"], booking_number=found["Buchungsnummer"],
 				prepaid="PRE-PAID" in raw,
 				booking_fee=float(fee.group(1)) if fee else 0.0,
 				deposit_amount=float(deposit.group(1)) if deposit else 0.0,
 				notes=notes.group(1).strip() if notes else None,
+				guest_message="\n".join(messages)[:2000] or None,
 			).model_dump())
 		except Exception as e:
 			# on ne met PAS le contenu du mail dans l'erreur (données personnelles)
@@ -402,7 +433,8 @@ def data_transformer_node(state: AgentState) -> dict:
 
 def load_list_node(state: AgentState) -> dict:
 	print("--- [5] load_list : dédoublonnage et lots ---")
-	unique = list({b["booking_number"]: b for b in state.get("transformed_data", [])}.values())
+	unique = [SmoobuBooking(**b).to_backend()
+			  for b in {b["booking_number"]: b for b in state.get("transformed_data", [])}.values()]
 	return ok(batched_payloads=[unique[i:i + 50] for i in range(0, len(unique), 50)])
 
 
@@ -411,8 +443,8 @@ def load_to_db_node(state: AgentState) -> dict:
 	try:
 		for batch in state.get("batched_payloads", []):
 			post_batch(batch)
-		imap_mark_seen(state.get("email_ids", []))  # marqués lus SEULEMENT après succès
-		print("Réservations insérées, e-mails marqués comme traités.")
+		imap_mark_processed(state.get("email_ids", []))  # libellé posé SEULEMENT après succès
+		print(f"Réservations insérées, e-mails marqués « {PROCESSED_LABEL} » dans Gmail.")
 		return ok()
 	except httpx.HTTPStatusError as e:
 		code = e.response.status_code
@@ -481,7 +513,7 @@ def notifier_node(state: AgentState) -> dict:
 		f"ANALYSE\n{rep.get('explanation', '')}\n\n"
 		f"SOLUTIONS À APPLIQUER\n{solutions}\n\n"
 		f"Relances automatiques déjà tentées : {state.get('attempts', {}).get(node, 0)}\n"
-		f"Les e-mails de réservation ne sont pas perdus : ils restent non lus dans Gmail.\n"
+		f"Les e-mails de réservation ne sont pas perdus : ils n'ont pas le libellé « {PROCESSED_LABEL} » et seront repris.\n"
 		f"Après correction, relancez : python smoobu_pipeline.py --unblock\n"
 	)
 	BLOCK_FILE.write_text(json.dumps({"node": node, "error": error[:2000], "since": time.ctime()}, indent=2),

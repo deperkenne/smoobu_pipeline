@@ -1,0 +1,16 @@
+# À copier dans la VM avec le fichier .env (aucun code source nécessaire).
+#   docker compose pull && docker compose up -d   -> télécharge la dernière image publiée par le CI et la lance
+#   docker compose logs -f                        -> suit les cycles du pipeline
+services:
+  pipeline:
+    image: ghcr.io/deperkenne/smoobu_pipeline:latest  # publiée par le CI à chaque push sur main
+    container_name: smoobu-pipeline
+    restart: unless-stopped  # relancé automatiquement après un redémarrage de la VM
+    env_file: .env  # secrets + SPRING_BOOT_URL : copiez .env.example en .env (jamais commité)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # = la VM elle-même, utile si le backend tourne dans la VM
+    volumes:
+      - pipeline-data:/data  # garde pipeline_blocked.json entre deux redémarrages
+
+volumes:
+  pipeline-data:

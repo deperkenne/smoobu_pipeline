@@ -17,6 +17,8 @@ Commandes
   python smoobu_pipeline.py             lance un cycle du pipeline
   python smoobu_pipeline.py --graph     affiche le graphe (Mermaid) sans rien exécuter
   python smoobu_pipeline.py --unblock   lève le blocage après une correction humaine
+  python smoobu_pipeline.py --review-only            revue du code par le LLM seule (utilisée par le CI)
+  python smoobu_pipeline.py --skip-checks --every 45 toutes les 45 min, sans revue ni tests (conteneur Docker)
 """
 import argparse
 import email
@@ -183,7 +185,10 @@ def structured_llm(schema):
 
 
 def run_git_diff() -> str:
-	r = subprocess.run(["git", "diff", "HEAD"], capture_output=True, text=True, check=True)
+	"""Diff à relire : depuis REVIEW_BASE (commit de base, fourni par le CI) ou les modifications locales."""
+	base = os.getenv("REVIEW_BASE")
+	cmd = ["git", "diff", base, "HEAD"] if base else ["git", "diff", "HEAD"]
+	r = subprocess.run(cmd, capture_output=True, text=True, check=True)
 	return r.stdout.strip()
 
 
@@ -572,24 +577,27 @@ def make_router(node_name: str):
 STOP_IF_EMPTY = {"pipeline_email": "raw_emails"}
 
 
-def build_graph():
+SCHEDULED_CHAIN = CHAIN[2:]  # lancement planifié (Docker) : revue et tests sont déjà faits par le CI
+
+
+def build_graph(chain=CHAIN):
 	wf = StateGraph(AgentState)
-	for name, fn in CHAIN:
+	for name, fn in chain:
 		wf.add_node(name, fn)
 	wf.add_node("debug_agent", debug_agent_node)
 	wf.add_node("notifier", notifier_node)
-	wf.set_entry_point(CHAIN[0][0])
+	wf.set_entry_point(chain[0][0])
 	#
 	# IMPORTANT : un nœud a SOIT des arêtes conditionnelles, SOIT une arête simple, jamais les deux.
 	# (avec les deux, LangGraph lance les deux branches : c'est ce qui rendait le graphe illisible)
-	for i, (name, _) in enumerate(CHAIN):
-		nxt = CHAIN[i + 1][0] if i + 1 < len(CHAIN) else END
+	for i, (name, _) in enumerate(chain):
+		nxt = chain[i + 1][0] if i + 1 < len(chain) else END
 		targets = {"debug": "debug_agent", "next": nxt}
 		if name in STOP_IF_EMPTY:
 			targets["stop"] = END
 		wf.add_conditional_edges(name, make_router(name), targets)
 
-	destinations = {"notifier": "notifier", **{name: name for name, _ in CHAIN}}
+	destinations = {"notifier": "notifier", **{name: name for name, _ in chain}}
 	wf.add_conditional_edges("debug_agent", route_after_debug, destinations)
 	wf.add_edge("notifier", END)
 	return wf.compile()
@@ -629,6 +637,12 @@ def main() -> int:
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--graph", action="store_true", help="affiche le graphe Mermaid")
 	parser.add_argument("--unblock", action="store_true", help="lève le blocage du pipeline")
+	parser.add_argument("--review-only", action="store_true",
+						help="revue du code par le LLM uniquement (CI) : code retour 1 si refusée")
+	parser.add_argument("--skip-checks", action="store_true",
+						help="saute la revue et les tests (déjà faits par le CI)")
+	parser.add_argument("--every", type=int, metavar="MINUTES",
+						help="relance le pipeline toutes les MINUTES minutes, sans s'arrêter")
 	args = parser.parse_args()
 
 	if args.graph:
@@ -638,11 +652,37 @@ def main() -> int:
 		BLOCK_FILE.unlink(missing_ok=True)
 		print("Pipeline débloqué.")
 		return 0
+	if args.review_only:
+		if not os.getenv("ANTHROPIC_API_KEY"):
+			print("Variable d'environnement manquante : ANTHROPIC_API_KEY")
+			return 1
+		result = code_reviewer_node({})
+		if result.get("current_error"):
+			print(result["current_error"])
+			return 1
+		return 0
 
 	missing = [v for v in ("ANTHROPIC_API_KEY", "GMAIL_APP_PASSWORD") if not os.getenv(v)]
 	if missing:
 		print(f"Variables d'environnement manquantes : {', '.join(missing)}")
 		return 1
+
+	skip_checks = args.skip_checks or os.getenv("PIPELINE_SKIP_CHECKS", "").lower() == "true"
+	graph = build_graph(SCHEDULED_CHAIN) if skip_checks else app
+	if not args.every:
+		return run_cycle(graph)
+
+	while True:  # mode planifié (conteneur Docker)
+		try:
+			run_cycle(graph)
+		except Exception as e:  # un cycle qui plante ne doit pas arrêter la planification
+			print(f"Cycle interrompu par une erreur inattendue : {e!r}")
+		print(f"Prochain cycle dans {args.every} min ({time.ctime(time.time() + args.every * 60)}).")
+		time.sleep(args.every * 60)
+
+
+def run_cycle(graph) -> int:
+	"""Un cycle complet du pipeline. Retourne 0 (OK), 2 (bloqué)."""
 	if BLOCK_FILE.exists():
 		print(f"Pipeline BLOQUÉ ({BLOCK_FILE.read_text(encoding='utf-8')}).\n"
 			  "Corrigez le problème puis lancez : python smoobu_pipeline.py --unblock")
@@ -657,7 +697,7 @@ def main() -> int:
 		"recursion_limit": 40,
 	}
 	try:
-		final = app.invoke({"attempts": {}, "requires_human": False, "current_error": None,
+		final = graph.invoke({"attempts": {}, "requires_human": False, "current_error": None,
 							"failed_node": None}, config=config)
 	finally:
 		flush_traces()

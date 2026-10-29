@@ -1,0 +1,9 @@
+.git
+.github
+.env
+.venv
+.idea
+__pycache__
+.pytest_cache
+pipeline_blocked.json
+.last_review.json

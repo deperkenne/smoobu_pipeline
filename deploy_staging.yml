@@ -1,0 +1,74 @@
+name: DeploymentStaging
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environnement cible (staging, preproduction ou production)
+        required: true
+        type: string
+      image:
+        description: Référence immuable de l'image (nom@sha256:...)
+        required: true
+        type: string
+
+permissions:
+  packages: read
+
+jobs:
+  deploy:
+    name: Déployer sur ${{ inputs.environment }}
+    # La condition s'assure que le job ne s'exécute que si inputs.environment est 'staging'
+    if: inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    # Rattache le job à l'environnement GitHub : c'est ici que s'appliquent
+    # ses secrets ET ses règles d'approbation manuelle.
+    environment: ${{ inputs.environment }}  # permet de charger le profil environement qui peut etre staging,preproduction ou prod
+    # Jamais deux déploiements en même temps sur un même environnement
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ inputs.image }}
+      # une fois l'environment destiner est charger github recupere toutes variable lie a cette environement
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+      HEALTH_URL: ${{ vars.HEALTH_URL }}
+      SERVER: ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}
+
+    steps:
+      - name: Préparer l'accès sécurisé au serveur
+        env:
+          SERVER: ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        # known_hosts : on se connecte uniquement au serveur attendu (protection contre l'usurpation)
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Autoriser temporairement le serveur à télécharger l'image
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}      # jeton valable uniquement le temps de ce déploiement
+        # Le jeton passe par l'entrée standard : il n'apparaît ni dans les logs ni dans la liste des processus
+        run: |
+          SERVER="$(printf '%s' "$SERVER" | tr -d '[:space:]')"
+          echo "$REGISTRY_TOKEN" | ssh -i ~/.ssh/id_deploy -p 22545 "$SERVER" "docker login ghcr.io -u '$GITHUB_ACTOR' --password-stdin"
+
+      - name: Démarrer la nouvelle version
+        run: |
+          SERVER="$(printf '%s' "$SERVER" | tr -d '[:space:]')"
+          ssh -i ~/.ssh/id_deploy -p 22545 "$SERVER" \
+            "cd '$DEPLOY_DIR' && export IMAGE='$IMAGE' COMPOSE_FILE=kafka.yml && docker compose pull && docker compose -f kafka.yml up -d --remove-orphans"
+
+      - name: Retirer l'accès au registre du serveur
+        if: always()
+        run: |
+          SERVER="$(printf '%s' "$SERVER" | tr -d '[:space:]')"
+          ssh -i ~/.ssh/id_deploy -p 22545 "$SERVER" "docker logout ghcr.io"
+
+      - name: Vérifier que l'application répond (jusqu'à 2 minutes et 30 secondes)
+        run: |
+          SERVER="$(printf '%s' "$SERVER" | tr -d '[:space:]')"
+          ssh -i ~/.ssh/id_deploy -p 22545 "$SERVER" "for attempt in \$(seq 1 30); do curl -fsS '$HEALTH_URL' && exit 0; sleep 5; done; exit 1"
